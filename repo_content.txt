@@ -1,0 +1,472 @@
+========= FILE: E:\loan-model-predictor\loan-approval-prediction\main.py =========
+"""main.py
+pipeline orchestration for loan prediction model"""
+
+import os
+from absl import logging
+from tfx.orchestration import metadata, pipeline
+from tfx.orchestration.beam.beam_dag_runner import BeamDagRunner
+from modules.components import init_components
+
+PIPELINE_NAME = "muhammad-fahmi-hutomo-pipeline"
+DATA_ROOT = "data"
+TRANSFORM_MODULE = os.path.abspath("modules/transform.py")
+TRAINER_MODULE = os.path.abspath("modules/trainer.py")
+TUNER_MODULE = os.path.abspath("modules/tuner.py")
+OUTPUT_BASE = "output"
+
+os.makedirs(OUTPUT_BASE, exist_ok=True)
+serving_model_dir = os.path.abspath(os.path.join(OUTPUT_BASE, 'serving_model'))
+pipeline_root = os.path.abspath(os.path.join(OUTPUT_BASE, PIPELINE_NAME))
+metadata_path = os.path.abspath(os.path.join(pipeline_root, "metadata.sqlite"))
+
+def init_pipeline(components):
+    beam_args = [
+        "--direct_running_mode=multi_processing",
+        "--direct_num_workers=0"
+    ]
+
+    return pipeline.Pipeline(
+        pipeline_name=PIPELINE_NAME,
+        pipeline_root=pipeline_root,
+        components=components,
+        enable_cache=False,
+        metadata_connection_config=metadata.sqlite_metadata_connection_config(metadata_path),
+        beam_pipeline_args=beam_args
+    )
+
+if __name__ == "__main__":
+    logging.set_verbosity(logging.INFO)
+    logging.info(f"Serving model will be saved to: {serving_model_dir}")
+    os.makedirs(serving_model_dir, exist_ok=True)
+
+    if not os.access(serving_model_dir, os.W_OK):
+        raise PermissionError(f"Cannot write to serving directory: {serving_model_dir}")
+
+    components = init_components(
+        DATA_ROOT,
+        TRANSFORM_MODULE,
+        TRAINER_MODULE,
+        serving_model_dir,
+        tuner_module=TUNER_MODULE
+    )
+
+    p = init_pipeline(components)
+    logging.info("Starting pipeline execution...")
+    BeamDagRunner().run(p)
+    logging.info(f"Pipeline completed. Check {serving_model_dir} for the saved model.")
+ 
+========= FILE: E:\loan-model-predictor\loan-approval-prediction\modules\components.py =========
+"""modules/components"""
+
+from tfx.components import (
+    CsvExampleGen, StatisticsGen, SchemaGen, ExampleValidator,
+    Transform, Trainer, Evaluator, Pusher, Tuner
+)
+from tfx.proto import example_gen_pb2, trainer_pb2, pusher_pb2, tuner_pb2
+from tfx.types import Channel
+from tfx.dsl.components.common.resolver import Resolver
+from tfx.types.standard_artifacts import Model, ModelBlessing
+from tfx.dsl.input_resolution.strategies.latest_blessed_model_strategy import LatestBlessedModelStrategy
+import tensorflow_model_analysis as tfma
+import os
+
+def init_components(data_dir, transform_module, training_module, serving_model_dir, tuner_module=None):
+    """Initialize TFX components for loan prediction pipeline with optional tuner."""
+
+    output = example_gen_pb2.Output(
+        split_config=example_gen_pb2.SplitConfig(splits=[
+            example_gen_pb2.SplitConfig.Split(name="train", hash_buckets=8),
+            example_gen_pb2.SplitConfig.Split(name="eval", hash_buckets=2)
+        ])
+    )
+    example_gen = CsvExampleGen(input_base=data_dir, output_config=output)
+    statistics_gen = StatisticsGen(examples=example_gen.outputs["examples"])
+    schema_gen = SchemaGen(statistics=statistics_gen.outputs["statistics"])
+    example_validator = ExampleValidator(
+        statistics=statistics_gen.outputs["statistics"],
+        schema=schema_gen.outputs["schema"]
+    )
+    transform = Transform(
+        examples=example_gen.outputs["examples"],
+        schema=schema_gen.outputs["schema"],
+        module_file=transform_module
+    )
+
+    tuner = None
+    if tuner_module:
+        tuner = Tuner(
+            module_file=tuner_module,
+            examples=transform.outputs['transformed_examples'],
+            transform_graph=transform.outputs['transform_graph'],
+            schema=schema_gen.outputs['schema'],
+            train_args=trainer_pb2.TrainArgs(splits=["train"]),
+            eval_args=trainer_pb2.EvalArgs(splits=["eval"]),
+            custom_config={
+                'keras_tuner': {
+                    'max_trials': 10,
+                    'directory': os.path.join(serving_model_dir, 'tuning'),
+                    'project_name': 'loan_tuning'
+                }
+            }
+        )
+
+    trainer = Trainer(
+        module_file=training_module,
+        examples=transform.outputs["transformed_examples"],
+        transform_graph=transform.outputs["transform_graph"],
+        schema=schema_gen.outputs["schema"],
+        train_args=trainer_pb2.TrainArgs(splits=["train"]),
+        eval_args=trainer_pb2.EvalArgs(splits=["eval"])
+    )
+
+    model_resolver = Resolver(
+        strategy_class=LatestBlessedModelStrategy,
+        model=Channel(type=Model),
+        model_blessing=Channel(type=ModelBlessing)
+    ).with_id("Latest_blessed_model_resolver")
+
+    eval_config = tfma.EvalConfig(
+        model_specs=[tfma.ModelSpec(label_key="Loan_Status")],
+        slicing_specs=[tfma.SlicingSpec()],
+        metrics_specs=[
+            tfma.MetricsSpec(metrics=[
+                tfma.MetricConfig(class_name="AUC"),
+                tfma.MetricConfig(
+                    class_name="BinaryAccuracy",
+                    threshold=tfma.MetricThreshold(
+                        value_threshold=tfma.GenericValueThreshold(lower_bound={"value": 0.5}),
+                        change_threshold=tfma.GenericChangeThreshold(
+                            direction=tfma.MetricDirection.HIGHER_IS_BETTER,
+                            absolute={"value": 0.0001}
+                        )
+                    )
+                ),
+                tfma.MetricConfig(class_name="ExampleCount")
+            ])
+        ]
+    )
+
+    evaluator = Evaluator(
+        examples=example_gen.outputs["examples"],
+        model=trainer.outputs["model"],
+        baseline_model=model_resolver.outputs["model"],
+        eval_config=eval_config
+    )
+
+    pusher = Pusher(
+        model=trainer.outputs["model"],
+        model_blessing=evaluator.outputs["blessing"],
+        push_destination=pusher_pb2.PushDestination(
+            filesystem=pusher_pb2.PushDestination.Filesystem(
+                base_directory=serving_model_dir
+            )
+        )
+    )
+
+    components = [
+        example_gen,
+        statistics_gen,
+        schema_gen,
+        example_validator,
+        transform
+    ]
+    if tuner:
+        components.append(tuner)
+    components += [
+        trainer,
+        model_resolver,
+        evaluator,
+        pusher
+    ]
+    return components
+ 
+========= FILE: E:\loan-model-predictor\loan-approval-prediction\modules\trainer.py =========
+"""modules/trainer.py"""
+
+import tensorflow as tf
+import tensorflow_transform as tft
+from tensorflow.keras import layers, models
+from tfx.components.trainer.fn_args_utils import FnArgs
+
+LABEL_KEY = "Loan_Status"
+CATEGORICAL_FEATURES = ["Gender", "Married", "Education", "Self_Employed", "Property_Area"]
+NUMERICAL_FEATURES = ["ApplicantIncome", "CoapplicantIncome", "LoanAmount",
+                     "Loan_Amount_Term", "Credit_History", "Dependents"]
+FEATURE_KEYS = CATEGORICAL_FEATURES + NUMERICAL_FEATURES
+
+def input_fn(file_pattern, tf_transform_output, num_epochs, batch_size=64):
+    file_paths = tf.io.gfile.glob(file_pattern)
+    transformed_feature_spec = tf_transform_output.transformed_feature_spec()
+    parse_feature_spec = transformed_feature_spec.copy()
+    label = parse_feature_spec.pop(LABEL_KEY)
+
+    def decode_fn(record_bytes):
+        parsed = tf.io.parse_single_example(record_bytes, parse_feature_spec)
+        label_value = tf.io.parse_single_example(record_bytes, {LABEL_KEY: label})[LABEL_KEY]
+        return parsed, label_value
+
+    dataset = tf.data.TFRecordDataset(file_paths, compression_type='GZIP')
+    dataset = dataset.map(decode_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.shuffle(2048)
+    dataset = dataset.repeat(num_epochs).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+def model_builder(tf_transform_output):
+    inputs = {
+        key: layers.Input(shape=(1,), name=key, dtype=tf.int64 if key in CATEGORICAL_FEATURES else tf.float32)
+        for key in FEATURE_KEYS
+    }
+
+    categorical = []
+    for key in CATEGORICAL_FEATURES:
+        vocab_size = tf_transform_output.vocabulary_size_by_name(f'{key}_vocab')
+        emb_dim = min(8, vocab_size)
+        x = layers.Embedding(input_dim=vocab_size + 1, output_dim=emb_dim, name=f'{key}_embedding')(inputs[key])
+        x = layers.Reshape((emb_dim,))(x)
+        categorical.append(x)
+    categorical = layers.concatenate(categorical)
+
+    numerical = layers.concatenate([inputs[key] for key in NUMERICAL_FEATURES])
+    numerical = layers.BatchNormalization()(numerical)
+    numerical = layers.Dense(16, activation='relu')(numerical)
+
+    x = layers.concatenate([categorical, numerical])
+    x = layers.Dense(32, activation='relu')(x)
+    x = layers.Dropout(0.2)(x)
+    x = layers.Dense(16, activation='relu')(x)
+    outputs = layers.Dense(1, activation='sigmoid')(x)
+
+    model = models.Model(inputs=inputs, outputs=outputs)
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def run_fn(fn_args: FnArgs):
+    tf_transform_output = tft.TFTransformOutput(fn_args.transform_graph_path)
+
+    train_dataset = input_fn(fn_args.train_files, tf_transform_output, num_epochs=10)
+    eval_dataset = input_fn(fn_args.eval_files, tf_transform_output, num_epochs=10)
+
+    model = model_builder(tf_transform_output)
+
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor='val_accuracy', patience=5, restore_best_weights=True)
+
+    model.fit(
+        train_dataset,
+        validation_data=eval_dataset,
+        epochs=30,
+        callbacks=[early_stop]
+    )
+
+    # Create serving function
+    tft_layer = tf_transform_output.transform_features_layer()
+    serving_inputs = {
+        key: tf.keras.Input(shape=(1,), name=key,
+            dtype=tf.string if key in CATEGORICAL_FEATURES else tf.float32)
+        for key in FEATURE_KEYS
+    }
+
+    transformed_features = tft_layer(serving_inputs)
+    outputs = model(transformed_features)
+    serving_model = tf.keras.Model(serving_inputs, outputs)
+
+    serving_model.save(fn_args.serving_model_dir, save_format='tf')
+ 
+========= FILE: E:\loan-model-predictor\loan-approval-prediction\modules\transform.py =========
+"""modules/transform.py"""
+
+import tensorflow as tf
+import tensorflow_transform as tft
+
+LABEL_KEY = "Loan_Status"
+FEATURE_KEYS = ["Gender", "Married", "Dependents", "Education", "Self_Employed", 
+                "ApplicantIncome", "CoapplicantIncome", "LoanAmount", 
+                "Loan_Amount_Term", "Credit_History", "Property_Area"]
+
+CATEGORICAL_FEATURES = ["Gender", "Married", "Education", "Self_Employed", "Property_Area"]
+NUMERICAL_FEATURES = ["Dependents", "ApplicantIncome", "CoapplicantIncome", "LoanAmount", 
+                      "Loan_Amount_Term", "Credit_History"]
+
+def preprocessing_fn(inputs):
+    outputs = {}
+
+    # Transform fitur kategorikal
+    for key in CATEGORICAL_FEATURES:
+        outputs[key] = tft.compute_and_apply_vocabulary(
+            tf.strings.lower(tf.strings.strip(inputs[key])),
+            vocab_filename=f'{key}_vocab'
+        )
+
+    # Transform fitur numerik
+    for key in NUMERICAL_FEATURES:
+        outputs[key] = tf.cast(inputs[key], tf.float32)
+
+    # Label (sudah 0/1 dari tahap cleaning)
+    outputs[LABEL_KEY] = tf.cast(inputs[LABEL_KEY], tf.float32)
+
+    return outputs
+ 
+========= FILE: E:\loan-model-predictor\loan-approval-prediction\modules\tuner.py =========
+"""modules/tuner.py"""
+
+import os
+import keras_tuner
+from keras_tuner import Objective
+import tensorflow as tf
+import tensorflow_transform as tft
+from tensorflow.keras import layers, metrics
+from tfx.components.trainer.fn_args_utils import FnArgs
+from tfx.components.tuner.component import TunerFnResult
+
+# Constants
+LABEL_KEY = "Loan_Status"
+BATCH_SIZE = 64
+EPOCHS = 10
+TRAIN_STEPS = 1000
+EVAL_STEPS = 500
+
+# Feature keys should match transform.py
+FEATURE_KEYS = [
+    "Gender", "Married", "Dependents", "Education", "Self_Employed",
+    "ApplicantIncome", "CoapplicantIncome", "LoanAmount", 
+    "Loan_Amount_Term", "Credit_History", "Property_Area"
+]
+
+CATEGORICAL_FEATURES = ["Gender", "Married", "Education", "Self_Employed", "Property_Area"]
+NUMERICAL_FEATURES = ["ApplicantIncome", "CoapplicantIncome", "LoanAmount", 
+                     "Loan_Amount_Term", "Credit_History", "Dependents"]
+
+def input_fn(file_pattern, tf_transform_output, batch_size=BATCH_SIZE):
+    """Create dataset from transformed data"""
+    transformed_feature_spec = tf_transform_output.transformed_feature_spec().copy()
+    
+    dataset = tf.data.experimental.make_batched_features_dataset(
+        file_pattern=file_pattern,
+        batch_size=batch_size,
+        features=transformed_feature_spec,
+        reader=lambda x: tf.data.TFRecordDataset(x, compression_type="GZIP"),
+        label_key=LABEL_KEY,
+        num_epochs=1
+    )
+    return dataset
+
+def get_hyperparameters() -> keras_tuner.HyperParameters:
+    """Define the hyperparameter search space."""
+    hp = keras_tuner.HyperParameters()
+    
+    # Architecture hyperparameters
+    hp.Int('num_layers', 1, 3)
+    for i in range(3):  # Max layers we might use
+        hp.Int(f'units_{i}', 32, 256, step=32)
+        hp.Float(f'dropout_{i}', 0.1, 0.5)
+    
+    # Learning rate
+    hp.Float('learning_rate', 1e-4, 1e-2, sampling='log')
+    
+    # Categorical features embedding
+    for feature in CATEGORICAL_FEATURES:
+        hp.Int(f'{feature}_vocab_size', 2, 16)
+        hp.Int(f'{feature}_embed_dim', 1, 4)
+    
+    return hp
+
+def build_model(hp: keras_tuner.HyperParameters):
+    """Model builder with hyperparameters"""
+    # Create input layers for all features
+    inputs = {
+        feature_name: layers.Input(shape=(1,), name=feature_name, dtype=tf.float32)
+        for feature_name in FEATURE_KEYS
+    }
+    
+    # Process numerical features
+    numerical_features = [
+        layers.Reshape((1,))(inputs[feature]) 
+        for feature in NUMERICAL_FEATURES
+    ]
+    
+    # Process categorical features
+    categorical_features = []
+    for feature in CATEGORICAL_FEATURES:
+        embed = layers.Embedding(
+            input_dim=hp.get(f'{feature}_vocab_size'),
+            output_dim=hp.get(f'{feature}_embed_dim')
+        )(inputs[feature])
+        embed = layers.Reshape((-1,))(embed)
+        categorical_features.append(embed)
+    
+    # Concatenate all features
+    concatenated = layers.concatenate(numerical_features + categorical_features)
+    
+    # Hidden layers with hyperparameter tuning
+    for i in range(hp.get('num_layers')):
+        concatenated = layers.Dense(
+            units=hp.get(f'units_{i}'),
+            activation='relu'
+        )(concatenated)
+        concatenated = layers.Dropout(
+            hp.get(f'dropout_{i}')
+        )(concatenated)
+    
+    # Output layer
+    outputs = layers.Dense(1, activation='sigmoid')(concatenated)
+    
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            hp.get('learning_rate')
+        ),
+        loss='binary_crossentropy',
+        metrics=[metrics.AUC(name='auc'), metrics.BinaryAccuracy()]
+    )
+    return model
+
+def tuner_fn(fn_args: FnArgs):
+    """Tuner function with proper TFX-compatible return format."""
+    tf_transform_output = tft.TFTransformOutput(fn_args.transform_graph_path)
+    
+    # Initialize the tuner
+    tuner = keras_tuner.RandomSearch(
+        hypermodel=build_model,
+        hyperparameters=get_hyperparameters(),
+        objective=Objective('val_auc', direction='max'),
+        max_trials=fn_args.custom_config['keras_tuner']['max_trials'],
+        directory=os.path.join(fn_args.custom_config['keras_tuner']['directory']),
+        project_name=fn_args.custom_config['keras_tuner']['project_name'],
+        overwrite=True
+    )
+
+    # Prepare datasets
+    train_dataset = input_fn(fn_args.train_files, tf_transform_output)
+    eval_dataset = input_fn(fn_args.eval_files, tf_transform_output)
+
+    # Run hyperparameter search
+    tuner.search(
+        train_dataset,
+        validation_data=eval_dataset,
+        epochs=EPOCHS,
+        steps_per_epoch=TRAIN_STEPS,
+        validation_steps=EVAL_STEPS,
+        callbacks=[
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_auc',
+                patience=3,
+                mode='max',
+                restore_best_weights=True
+            )
+        ]
+    )
+
+    # Return the proper TFX TunerFnResult
+    return TunerFnResult(
+        tuner=tuner,
+        fit_kwargs={
+            'x': train_dataset,
+            'validation_data': eval_dataset,
+            'steps_per_epoch': TRAIN_STEPS,
+            'validation_steps': EVAL_STEPS
+        }
+    )
+ 
+========= FILE: E:\loan-model-predictor\loan-approval-prediction\modules\__init__.py =========
+ 

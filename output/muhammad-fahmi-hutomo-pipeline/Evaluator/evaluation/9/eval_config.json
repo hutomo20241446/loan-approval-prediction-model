@@ -1,0 +1,41 @@
+{
+  "evalConfig": {
+    "modelSpecs": [
+      {
+        "labelKey": "Loan_Status"
+      }
+    ],
+    "slicingSpecs": [
+      {}
+    ],
+    "metricsSpecs": [
+      {
+        "metrics": [
+          {
+            "className": "AUC"
+          },
+          {
+            "className": "BinaryAccuracy",
+            "threshold": {
+              "valueThreshold": {
+                "lowerBound": 0.5
+              }
+            }
+          },
+          {
+            "className": "ExampleCount"
+          }
+        ],
+        "modelNames": [
+          ""
+        ]
+      }
+    ]
+  },
+  "version": "0.42.0",
+  "dataLocation": "<user provided PCollection>",
+  "fileFormat": "<unknown>",
+  "modelLocations": {
+    "": "E:\\loan-model-predictor\\loan-approval-prediction\\output\\muhammad-fahmi-hutomo-pipeline\\Trainer\\model\\7\\Format-Serving"
+  }
+}

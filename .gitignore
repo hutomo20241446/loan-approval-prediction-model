@@ -1,0 +1,30 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Editor & OS junk
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python environment
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Logs
+*.log
+
+# Configs with secrets (adjust if needed)
+.env
+*.secret
